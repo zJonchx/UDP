@@ -714,4 +714,4 @@ if __name__ == '__main__':
             break
         except Exception as e:
             print(f"Fatal error: {e}")
-            time.sleep(5))
+            time.sleep(5)
