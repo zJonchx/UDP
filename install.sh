@@ -5,8 +5,8 @@
 # ============================================================
 
 # --- CONFIGURACIÓN ---
-PAYLOAD_URL="https://raw.githubusercontent.com/zJonchx/UDP/main/kitsune.c"
-BIN_NAME="kitsune"
+PAYLOAD_URL="https://raw.githubusercontent.com/zJonchx/UDP/main/payload.c"
+BIN_NAME="payload"
 SCREEN_SESSION="kitsune_session"
 WORK_DIR="/tmp/kitsune_build"
 
