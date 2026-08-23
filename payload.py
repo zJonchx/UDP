@@ -134,7 +134,7 @@ def Av(ip,port,secs,stop_event):
 				try:A.close()
 				except:pass
 		except:pass
-	Y=K();Q(f"[HTTP] Target: {"https"if T else"http"}://{ip}:{M} | Workers: {Y}");a=[]
+	Y=K();Q(f"[HTTP] Target: {'https'if T else'http'}://{ip}:{M} | Workers: {Y}");a=[]
 	for k in E(Y):L=F.Thread(target=j,args=(k,),daemon=D);L.start();a.append(L);B.sleep(.001)
 	B.sleep(secs);O.set()
 	for L in a:
